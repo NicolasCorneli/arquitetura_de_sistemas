@@ -1,10 +1,10 @@
 const prisma = require("../db/prisma");
 const axiosInstance = require("../utils/axiosInstance");
+const { sendNotification } = require("../utils/rabbit"); // ✅ integração com RabbitMQ
 
 // Bases (com fallback)
 const ORDERS_BASE   = process.env.ORDERS_BASE_URL   || "http://orders:3002/order-service/v1/orders";
 const PRODUCTS_BASE = process.env.PRODUCTS_BASE_URL || "http://products:3001/product-service/v1/products";
-const NOTIF_BASE    = process.env.NOTIF_BASE_URL    || "http://notification:3005/notification-service/v1/notify";
 
 // Atualiza estoque de um produto (delta pode ser negativo para reduzir)
 async function adjustProductStock(productId, delta) {
@@ -30,6 +30,7 @@ async function processPayment(req, res) {
       return res.status(400).json({ error: "Invalid orderId format" });
     }
 
+    // Busca o pedido correspondente
     const orderResp = await axiosInstance.get(`${ORDERS_BASE}/${orderId}`);
     const order = orderResp.data;
     if (!order) {
@@ -40,6 +41,7 @@ async function processPayment(req, res) {
       return res.status(404).json({ error: "Related order not found" });
     }
 
+    // Extrai os itens do pedido
     const items = Array.isArray(order.products)
       ? order.products
       : (order.productId && order.quantity
@@ -54,6 +56,7 @@ async function processPayment(req, res) {
       return res.status(400).json({ error: "Order has no items" });
     }
 
+    // Valida e ajusta estoque
     const updated = [];
     try {
       for (const item of items) {
@@ -68,6 +71,7 @@ async function processPayment(req, res) {
         updated.push({ pid, qty });
       }
     } catch (e) {
+      // rollback de estoque
       for (const u of updated) {
         try { await adjustProductStock(u.pid, +u.qty); } catch {}
       }
@@ -76,10 +80,12 @@ async function processPayment(req, res) {
       return res.status(400).json({ error: e.message });
     }
 
+    // Simula sucesso ou falha do pagamento
     const successProbability = parseFloat(process.env.PAYMENT_SUCCESS_PROB || "0.7");
     const ok = Math.random() <= successProbability;
 
     if (!ok) {
+      // pagamento falhou → rollback
       for (const u of updated) {
         try { await adjustProductStock(u.pid, +u.qty); } catch {}
       }
@@ -88,17 +94,21 @@ async function processPayment(req, res) {
       return res.status(402).json({ error: "Payment failed (simulated)" });
     }
 
+    // Marca pagamento como "PAID"
     const processed = await prisma.payment.update({
       where: { id: Number(id) },
       data: { status: "PAID" },
     });
 
+    // Atualiza status do pedido para PAID
     axiosInstance.patch(`${ORDERS_BASE}/${orderId}/status`, { status: "PAID" });
 
-    // axiosInstance.post(NOTIF_BASE, {
-    //   clientId: order.userId ?? order.clientId,
-    //   message: `Your order ${orderId} was paid and confirmed.`,
-    // }).catch(() => {});
+    // ✅ Envia notificação assíncrona via RabbitMQ
+    const clientId = order.userId ?? order.clientId ?? "unknown";
+    const message = `💰 Pagamento do pedido ${orderId} confirmado com sucesso!`;
+    await sendNotification(clientId, message);
+
+    console.log(`📨 Notificação enfileirada para cliente ${clientId}: ${message}`);
 
     return res.json({ success: true, payment: processed });
   } catch (error) {
@@ -127,6 +137,7 @@ async function createPayment(req, res) {
   }
 }
 
+// GET /payment-service/v1/payments
 async function getAllPayments(req, res) {
   try {
     const { order_id } = req.query;
@@ -141,6 +152,7 @@ async function getAllPayments(req, res) {
   }
 }
 
+// GET /payment-service/v1/payments/:id
 async function getPaymentById(req, res) {
   try {
     const { id } = req.params;
