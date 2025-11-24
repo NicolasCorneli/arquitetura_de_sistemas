@@ -1,0 +1,276 @@
+version: "3.8"
+
+services:
+  # ========== Databases ==========
+  postgres-products:
+    image: postgres:15
+    container_name: postgres_products
+    restart: always
+    environment:
+      POSTGRES_USER: products_user
+      POSTGRES_PASSWORD: prod_s3cret_!A9
+      POSTGRES_DB: products_db
+    volumes:
+      - products_pgdata:/var/lib/postgresql/data
+    networks: [ app-net ]
+    ports:
+      - "5433:5432"
+
+  postgres-payments:
+    image: postgres:15
+    container_name: postgres_payments
+    restart: always
+    environment:
+      POSTGRES_USER: payments_user
+      POSTGRES_PASSWORD: paym_s3cret_!B7
+      POSTGRES_DB: payments_db
+    volumes:
+      - payments_pgdata:/var/lib/postgresql/data
+    networks: [ app-net ]
+    ports:
+      - "5434:5432"
+
+  postgres-users:
+    image: postgres:15
+    container_name: postgres_users
+    restart: always
+    environment:
+      POSTGRES_USER: users_user
+      POSTGRES_PASSWORD: usrs_s3cret_!C5
+      POSTGRES_DB: users_db
+    volumes:
+      - users_pgdata:/var/lib/postgresql/data
+    networks: [ app-net ]
+    ports:
+      - "5435:5432"
+
+  orders-db:
+    image: mongo:6.0
+    container_name: orders_mongo
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminStrong_!D3
+      MONGO_INITDB_DATABASE: orders_db
+    volumes:
+      - orders_mongo_data:/data/db
+    networks: [ app-net ]
+    ports:
+      - "27017:27017"
+
+  # ========== KAFKA INFRA ==========
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks: [ app-net ]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks: [ app-net ]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    ports:
+      - "8080:8080"
+    restart: always
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    depends_on:
+      - kafka
+      - zookeeper
+    networks:
+      - app-net
+
+  # ========== Services ==========
+  products:
+    build: ./products
+    container_name: products_service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://products_user:prod_s3cret_!A9@postgres-products:5432/products_db?schema=public
+    depends_on: [ postgres-products ]
+    networks: [ app-net ]
+    ports:
+      - "3001:3001"
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma db push &&
+        node src/server.js
+      "
+
+  orders:
+    build: ./orders
+    container_name: orders_service
+    restart: always
+    environment:
+      MONGODB_URL: mongodb://admin:adminStrong_!D3@orders-db:27017/orders_db?authSource=admin
+      MONGODB_DB: orders_db
+      PRODUCTS_BASE_URL: http://products:3001/product-service/v1/products
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: orders-payments
+    depends_on: [ orders-db, kafka ]
+    networks: [ app-net ]
+    ports:
+      - "3002:3002"
+    command: >
+      sh -c "
+        node src/server.js
+      "
+
+  payments:
+    build: ./payments
+    container_name: payments_service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://payments_user:paym_s3cret_!B7@postgres-payments:5432/payments_db?schema=public
+      PAYMENT_SUCCESS_PROB: "0.7"
+      ORDERS_BASE_URL: http://orders:3002/order-service/v1/orders
+      PRODUCTS_BASE_URL: http://products:3001/product-service/v1/products
+      NOTIF_BASE_URL: http://notification:3005/notification-service/v1/notify
+      USERS_BASE_URL: http://users:3004/user-service/v1/clients
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: orders-payments
+    depends_on: [ postgres-payments, orders, products, notification, rabbitmq, kafka ]
+    networks: [ app-net ]
+    ports:
+      - "3003:3003"
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma db push &&
+        node src/server.js
+      "
+
+  users:
+    build: ./users
+    container_name: users_service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://users_user:usrs_s3cret_!C5@postgres-users:5432/users_db?schema=public
+    depends_on: [ postgres-users ]
+    networks: [ app-net ]
+    ports:
+      - "3004:3004"
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma db push &&
+        node src/server.js
+      "
+
+  notification:
+    build: ./notification
+    container_name: notification_service
+    restart: always
+    depends_on: [rabbitmq]
+    networks: [ app-net ]
+    ports:
+      - "3005:3005"
+
+  # === INFRA DE MONITORAMENTO ===
+  influxdb:
+    image: influxdb:1.8
+    container_name: influxdb
+    restart: always
+    ports:
+      - "8086:8086"
+    environment:
+      - INFLUXDB_DB=k6
+      - INFLUXDB_HTTP_AUTH_ENABLED=false
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+      - ./influxdb-init/init-influxdb.sh:/docker-entrypoint-initdb.d/init-influxdb.sh
+    networks:
+      - app-net
+
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - influxdb
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - app-net
+
+  # === K6 ===
+  k6:
+    image: grafana/k6:latest
+    container_name: k6_runner
+    depends_on:
+      - payments
+      - orders
+      - influxdb
+    volumes:
+      - ./k6-scripts:/scripts
+    entrypoint: ["k6"]
+    networks:
+      - app-net
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    networks:
+      - app-net
+
+  seeder:
+    image: node:18-alpine
+    container_name: seeder
+    working_dir: /usr/src/app
+    volumes:
+      - ./seeds:/usr/src/app
+    depends_on:
+      - products
+      - users
+      - orders
+      - payments
+    networks: [ app-net ]
+    command: ["sh", "-c", "npm install && node seed.js"]
+    restart: "no"
+
+networks:
+  app-net:
+    driver: bridge
+
+volumes:
+  products_pgdata:
+  payments_pgdata:
+  users_pgdata:
+  orders_mongo_data:
+  influxdb_data:
+  grafana_data:

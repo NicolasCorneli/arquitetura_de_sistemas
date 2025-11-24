@@ -1,0 +1,16 @@
+{
+  "name": "users-service",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "generate": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.18.0",
+    "axios": "^1.12.2",
+    "express": "^4.19.2",
+    "prisma": "^5.18.0"
+  }
+}
