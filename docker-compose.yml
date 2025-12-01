@@ -1,0 +1,382 @@
+version: "3.8"
+
+services:
+  # === KONG DATABASE ===
+  kong-db:
+    image: postgres:15
+    container_name: kong_db
+    restart: always
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong_password
+      POSTGRES_DB: kong
+    volumes:
+      - kong_postgres_data:/var/lib/postgresql/data
+    networks: [ app-net ]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kong -h localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Run kong migrations once (wait for DB)
+  kong-migrations:
+    image: kong:3.6
+    command: [ "kong", "migrations", "bootstrap" ]
+    networks:
+      - app-net
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_DATABASE: kong
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong_password
+    depends_on:
+      kong-db:
+        condition: service_healthy
+
+  kong:
+    image: kong:3.6
+    restart: always
+    networks:
+      - app-net
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_DATABASE: kong
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong_password
+
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+
+    depends_on:
+      kong-migrations:
+        condition: service_completed_successfully
+
+    ports:
+    - "8000:8000"
+    - "8001:8001"
+    - "8443:8443"
+    - "8444:8444"
+  
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  
+  kong-init:
+    image: alpine
+    depends_on:
+      kong:
+        condition: service_healthy
+    networks:
+      - app-net
+    volumes:
+      - ./kong-init.sh:/kong-init.sh
+    command: >
+      sh -c "
+        apk add --no-cache curl jq &&
+        sh /kong-init.sh
+      "
+    restart: "no"
+
+  konga:
+    image: pantsel/konga
+    container_name: konga_ui
+    restart: always
+    environment:
+      NODE_ENV: development
+      KONGA_KONG_ADMIN_URL: http://kong:8001
+    ports:
+      - "1337:1337"
+    depends_on:
+      - kong
+    networks: [ app-net ]
+
+  # === REDIS + UI ===
+  redis:
+    image: redis:7
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks: [ app-net ]
+
+  redisinsight:
+    image: redislabs/redisinsight:latest
+    container_name: redisinsight
+    restart: always
+    ports:
+      - "8002:8001"
+    networks: [ app-net ]
+    depends_on:
+      - redis
+
+  # === Infra/monitoring ===
+  influxdb:
+    image: influxdb:1.8
+    container_name: influxdb
+    restart: always
+    ports:
+      - "8086:8086"
+    environment:
+      - INFLUXDB_DB=k6
+      - INFLUXDB_HTTP_AUTH_ENABLED=false
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+      - ./influxdb-init/init-influxdb.sh:/docker-entrypoint-initdb.d/init-influxdb.sh
+    networks: [ app-net ]
+
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - influxdb
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks: [ app-net ]
+
+  # === Kafka infra ===
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks: [ app-net ]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks: [ app-net ]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    ports:
+      - "8080:8080"
+    restart: always
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    depends_on:
+      - kafka
+      - zookeeper
+    networks: [ app-net ]
+
+  # === App services ===
+  products:
+    build: ./products
+    container_name: products_service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://products_user:prod_s3cret_!A9@postgres-products:5432/products_db?schema=public
+    depends_on: [ postgres-products ]
+    networks: [ app-net ]
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma db push &&
+        node src/server.js
+      "
+
+  orders:
+    build: ./orders
+    container_name: orders_service
+    restart: always
+    environment:
+      MONGODB_URL: mongodb://admin:adminStrong_!D3@orders-db:27017/orders-db?authSource=admin
+      MONGODB_DB: orders_db
+      PRODUCTS_BASE_URL: http://products:3001/product-service/v1/products
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: orders-payments
+    depends_on: [ orders-db, kafka ]
+    networks: [ app-net ]
+    command: >
+      sh -c "
+        node src/server.js
+      "
+
+  payments:
+    build: ./payments
+    container_name: payments_service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://payments_user:paym_s3cret_!B7@postgres-payments:5432/payments_db?schema=public
+      PAYMENT_SUCCESS_PROB: "0.7"
+      ORDERS_BASE_URL: http://orders:3002/order-service/v1/orders
+      PRODUCTS_BASE_URL: http://products:3001/product-service/v1/products
+      NOTIF_BASE_URL: http://notification:3005/notification-service/v1/notify
+      USERS_BASE_URL: http://users:3004/user-service/v1/clients
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: orders-payments
+      REDIS_URL: redis://redis:6379
+    depends_on: [ postgres-payments, orders, products, notification, rabbitmq, kafka, redis ]
+    networks: [ app-net ]
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma db push &&
+        node src/server.js
+      "
+
+  users:
+    build: ./users
+    container_name: users_service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://users_user:usrs_s3cret_!C5@postgres-users:5432/users_db?schema=public
+    depends_on: [ postgres-users ]
+    networks: [ app-net ]
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma db push &&
+        node src/server.js
+      "
+
+  notification:
+    build: ./notification
+    container_name: notification_service
+    restart: always
+    depends_on: [ rabbitmq ]
+    networks: [ app-net ]
+
+  # === Databases ===
+  postgres-products:
+    image: postgres:15
+    container_name: postgres_products
+    restart: always
+    environment:
+      POSTGRES_USER: products_user
+      POSTGRES_PASSWORD: prod_s3cret_!A9
+      POSTGRES_DB: products_db
+    volumes:
+      - products_pgdata:/var/lib/postgresql/data
+    networks: [ app-net ]
+
+  postgres-payments:
+    image: postgres:15
+    container_name: postgres_payments
+    restart: always
+    environment:
+      POSTGRES_USER: payments_user
+      POSTGRES_PASSWORD: paym_s3cret_!B7
+      POSTGRES_DB: payments_db
+    volumes:
+      - payments_pgdata:/var/lib/postgresql/data
+    networks: [ app-net ]
+
+  postgres-users:
+    image: postgres:15
+    container_name: postgres_users
+    restart: always
+    environment:
+      POSTGRES_USER: users_user
+      POSTGRES_PASSWORD: usrs_s3cret_!C5
+      POSTGRES_DB: users_db
+    volumes:
+      - users_pgdata:/var/lib/postgresql/data
+    networks: [ app-net ]
+
+  orders-db:
+    image: mongo:6.0
+    container_name: orders_mongo
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminStrong_!D3
+      MONGO_INITDB_DATABASE: orders_db
+    volumes:
+      - orders_mongo_data:/data/db
+    networks: [ app-net ]
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    networks: [ app-net ]
+
+  seeder:
+    image: node:18-alpine
+    container_name: seeder
+    working_dir: /usr/src/app
+    volumes:
+      - ./seeds:/usr/src/app
+    depends_on:
+      kong-init:
+        condition: service_completed_successfully
+      products:
+        condition: service_started
+      users:
+        condition: service_started
+      orders:
+        condition: service_started
+      payments:
+        condition: service_started
+
+    networks:
+      - app-net
+
+    environment:
+      PRODUCTS_URL: http://products:3001/product-service/v1/products
+      USERS_URL: http://users:3004/user-service/v1/clients
+      ORDERS_URL: http://orders:3002/order-service/v1/orders
+
+    command: >
+      sh -c "
+        echo 'Waiting 10s for all services to stabilize...' &&
+        sleep 10 &&
+        npm install &&
+        node seed.js
+      "
+
+    restart: "no"
+
+volumes:
+  products_pgdata:
+  payments_pgdata:
+  users_pgdata:
+  orders_mongo_data:
+  influxdb_data:
+  grafana_data:
+  kong_postgres_data:
+  redis_data:
+
+networks:
+  app-net:
+    driver: bridge
