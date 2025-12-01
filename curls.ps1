@@ -68,14 +68,14 @@ curl "http://localhost:8000/order-service/v1/orders"
 Read-Host "Pressione ENTER para continuar..."
 
 Write-Host "`n--- ORDERS: Get order by ID ---"
-curl "http://localhost:8000/order-service/v1/orders/1"
+curl "http://localhost:8000/order-service/v1/orders/1" ##lembre-se de passar o ID certo
 Read-Host "Pressione ENTER para continuar..."
 
 Write-Host "`n--- ORDERS: Create order ---"
 curl -Method POST `
      -Uri "http://localhost:8000/order-service/v1/orders" `
      -ContentType "application/json" `
-     -Body '{ "userId": 1, "products":[{"productId":1,"quantity":1}]}'
+     -Body '{ "userId": 1, "products":[{"productId":1,"quantity":1}]}' ##lembre-se de passar o ID certo
 Read-Host "Pressione ENTER para continuar..."
 
 Write-Host "`n--- ORDERS: Update order status ---"
@@ -109,3 +109,4 @@ Read-Host "Pressione ENTER para continuar..."
 
 
 Write-Host "`n=== FINALIZADO ==="
+
